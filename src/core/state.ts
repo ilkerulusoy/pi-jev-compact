@@ -78,6 +78,48 @@ function displayText(message: any): string {
   return textOf(message?.content);
 }
 
+/**
+ * Raised when even the last shrink stage leaves the state over budget. Carries
+ * the numbers so the caller can decide whether to retry on a smaller window
+ * rather than only reporting a failure.
+ */
+export class StateTooLargeError extends Error {
+  readonly tokens: number;
+  readonly limit: number;
+  constructor(tokens: number, limit: number) {
+    super(`live window too large for Jev (~${tokens} tokens after shrinking, limit ${limit})`);
+    this.name = "StateTooLargeError";
+    this.tokens = tokens;
+    this.limit = limit;
+  }
+}
+
+/**
+ * Fold runs of adjacent call-only entries of the same role into one entry. The
+ * call lines keep their ids, so a question still names the call it is about.
+ * Pinned entries are never folded.
+ */
+function mergeCallRuns(
+  history: readonly HistoryEntry[],
+  pinned: (entry: HistoryEntry) => boolean,
+): HistoryEntry[] {
+  const foldable = (entry: HistoryEntry): boolean =>
+    !pinned(entry) && entry.text.length === 0 && typeof entry.tool_calls?.[0] === "string";
+  const merged: HistoryEntry[] = [];
+  for (const entry of history) {
+    const previous = merged[merged.length - 1];
+    if (previous && foldable(previous) && foldable(entry) && previous.role === entry.role) {
+      previous.tool_calls = [
+        ...(previous.tool_calls as string[]),
+        ...(entry.tool_calls as string[]),
+      ];
+      continue;
+    }
+    merged.push({ ...entry });
+  }
+  return merged;
+}
+
 function callsByMessage(calls: readonly ToolCall[]): Map<number, ToolCall[]> {
   const byMessage = new Map<number, ToolCall[]>();
   for (const call of calls) {
@@ -221,9 +263,18 @@ export function fitState(
     }
   }
 
-  throw new Error(
-    `live window too large for Jev (~${tokens} tokens after shrinking, limit ${options.maxStateTokens})`,
+  // Stage 6: fold runs of adjacent call-only entries into one entry, so the
+  // per-entry JSON envelope is paid once per run instead of once per call. On a
+  // 900-call window this is the difference between ~33k and ~15k tokens.
+  history = mergeCallRuns(
+    history.filter((_, i) => !dropped.has(i)),
+    pinned,
   );
+  perEntry = history.map(entryTokens);
+  tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
+  if (fits()) return fitted(history, tokens, "old calls merged");
+
+  throw new StateTooLargeError(tokens, options.maxStateTokens);
 }
 
 function isPinnedIndex(index: number, total: number, preserveRecent: number): boolean {

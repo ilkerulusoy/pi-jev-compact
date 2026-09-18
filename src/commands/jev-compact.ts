@@ -1,7 +1,7 @@
 import { collectLiveWindow, goalFrom } from "../core/live-window";
-import { collectToolCalls } from "../core/tool-calls";
+import { collectToolCalls, messageChars } from "../core/tool-calls";
 import { scoreCalls } from "../core/decide";
-import { fitState } from "../core/state";
+import { fitState, StateTooLargeError } from "../core/state";
 import { planReplay, reductionRatio, validatePlan } from "../core/replay";
 import { JevClient, resolveApiKey } from "../core/jev";
 import { DEFAULT_SETTINGS } from "../types";
@@ -23,6 +23,9 @@ export interface RunOutcome {
     stateTokens: number;
     stateStage: string;
     requests: number;
+    scopedTo?: number;
+    totalCalls?: number;
+    totalMessages?: number;
   };
   plan?: any[];
 }
@@ -56,25 +59,63 @@ export async function planCompaction(
     };
   }
 
+  // A window can be too large to describe to Jev even after every shrink stage,
+  // which happens on sessions with thousands of tool calls. Rather than giving up,
+  // score the oldest slice that does fit: the oldest calls are both the most
+  // likely to be stale and the ones a later run would reach last. The newer calls
+  // stay untouched this time, so the command can be run again.
+  //
+  // The slice boundary is a message index, so a call and its result always travel
+  // together and pinning still applies to the original window.
   let fitted;
-  try {
-    fitted = fitState(window.messages, calls, {
-      maxStateTokens: settings.maxStateTokens,
-      preserveRecentMessages: settings.preserveRecentMessages,
-      goal: goalFrom(window.messages),
-    });
-  } catch (error) {
-    return { status: "error", message: `pi-jev-compact: ${(error as Error).message}` };
+  let scoped = window.messages;
+  let scopedCalls = calls;
+  let slicedFrom: number | undefined;
+
+  for (;;) {
+    try {
+      fitted = fitState(scoped, scopedCalls, {
+        maxStateTokens: settings.maxStateTokens,
+        preserveRecentMessages: scoped === window.messages ? settings.preserveRecentMessages : 0,
+        goal: goalFrom(window.messages),
+      });
+      break;
+    } catch (error) {
+      if (!(error instanceof StateTooLargeError)) {
+        return { status: "error", message: `pi-jev-compact: ${(error as Error).message}` };
+      }
+      // Halve the slice, keeping the oldest half, and stop if it cannot shrink.
+      const nextLength = Math.floor(scoped.length / 2);
+      if (nextLength < 4) {
+        return {
+          status: "error",
+          message: `pi-jev-compact: ${error.message}. Even the oldest slice does not fit.`,
+        };
+      }
+      slicedFrom = nextLength;
+      scoped = window.messages.slice(0, nextLength);
+      scopedCalls = collectToolCalls(scoped, 0).filter((call) =>
+        calls.some((original) => original.toolCallId === call.toolCallId && !original.pinned),
+      );
+      if (scopedCalls.length === 0) {
+        return {
+          status: "error",
+          message: `pi-jev-compact: ${error.message}. No unpinned calls survive slicing.`,
+        };
+      }
+    }
   }
 
   let scored;
   try {
-    scored = await scoreCalls(calls, fitted.state, fitted.tokens, asker, settings);
+    scored = await scoreCalls(scopedCalls, fitted.state, fitted.tokens, asker, settings);
   } catch (error) {
     return { status: "error", message: `pi-jev-compact: ${(error as Error).message}` };
   }
 
-  const plan = planReplay(window.messages, calls, scored.decisions, settings);
+  // Decisions are numbered against `scopedCalls`, so the plan must be built from
+  // the same list. Calls outside the slice are simply not in it and stay as they are.
+  const plan = planReplay(window.messages, scopedCalls, scored.decisions, settings);
   const problems = validatePlan(plan.messages);
   if (problems.length > 0) {
     return {
@@ -88,7 +129,7 @@ export async function planCompaction(
 
   const reduction = reductionRatio(plan);
   const stats = {
-    calls: calls.length,
+    calls: scopedCalls.length,
     kept: count(scored.decisions, "kept"),
     resultsDropped: count(scored.decisions, "result_dropped"),
     callsDropped: count(scored.decisions, "call_dropped"),
@@ -99,10 +140,27 @@ export async function planCompaction(
     stateTokens: fitted.tokens,
     stateStage: fitted.stage,
     requests: scored.requests,
+    ...(slicedFrom === undefined
+      ? {}
+      : { scopedTo: slicedFrom, totalCalls: calls.length, totalMessages: window.messages.length }),
   };
-  const summary = `${percent(reduction)} smaller; ${stats.kept} kept, ${stats.resultsDropped} results truncated, ${stats.callsDropped} calls dropped, ${stats.pinned} pinned; state ~${stats.stateTokens} tok (${stats.stateStage}) in ${stats.requests} request(s)`;
+  const scopeNote =
+    slicedFrom === undefined
+      ? ""
+      : ` (oldest ${slicedFrom}/${window.messages.length} messages only: the full window does not fit, run again for the rest)`;
+  const summary = `${percent(reduction)} smaller; ${stats.kept} kept, ${stats.resultsDropped} results truncated, ${stats.callsDropped} calls dropped, ${stats.pinned} pinned; state ~${stats.stateTokens} tok (${stats.stateStage}) in ${stats.requests} request(s)${scopeNote}`;
 
-  if (reduction < settings.minReductionRatio) {
+  // The threshold asks whether the work was worth doing. On a sliced run the
+  // saving is measured against the whole window, but only the slice was scored,
+  // so compare against the part that could actually change.
+  const scopedBefore =
+    slicedFrom === undefined
+      ? plan.charsBefore
+      : scoped.reduce((sum, { message }) => sum + messageChars(message), 0);
+  const effectiveReduction =
+    scopedBefore === 0 ? 0 : (plan.charsBefore - plan.charsAfter) / scopedBefore;
+
+  if (effectiveReduction < settings.minReductionRatio) {
     return {
       status: "below_threshold",
       message: `pi-jev-compact: not worth it, ${summary}. Nothing written.`,

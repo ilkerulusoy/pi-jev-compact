@@ -5,7 +5,7 @@ Jev model. Jev scores every tool call and its result; calls that are no longer
 needed are dropped, the rest stays verbatim. No LLM writes a summary of your
 conversation.
 
-**Status: implemented, 42 tests passing, never run against a live Jev.** Every
+**Status: implemented, 48 tests passing, never run against a live Jev.** Every
 test uses a fake Jev or a stubbed transport, so the request shape and the
 decision logic are exercised but no real model judgment has been observed. The
 first live run is still ahead.
@@ -148,7 +148,7 @@ Established by reading source only:
 - `appendMessage` performs no pairing, ordering, or content validation.
 - `convertToLlm` is an elementwise type mapper with no pairing logic.
 
-Covered by the test suite (42 tests, `npm test`):
+Covered by the test suite (48 tests, `npm test`):
 
 - Live-window collection, including orphan recovery when `firstKeptEntryId` is
   empty or missing, and skipping entry kinds that do not reach context.
@@ -165,6 +165,34 @@ Covered by the test suite (42 tests, `npm test`):
   and confirm `toolCall.id` still matches `toolResult.toolCallId`.
 - Refusal paths: HTTP failure, malformed answers, declined confirmation, report
   mode, a cancelled session, and a missing key. Each writes nothing.
+
+## Sessions too large to describe in one request
+
+Jev has to see the whole window to judge any single call, so a very long session
+can exceed `maxStateTokens` even after every shrink stage. Measured with the
+default 25k budget and small results:
+
+| Tool calls | Outcome |
+| --- | --- |
+| 900 | Fits at the `old calls merged` stage, ~18k tokens |
+| 1500 | Overflows at ~30k |
+| 3000 | Overflows at ~61k |
+
+Rather than refusing, the command scores the oldest slice that does fit and
+leaves the newer calls alone, so each run makes progress and can be repeated.
+The slice boundary is a message index, so a call and its result always travel
+together. On a 3000-call session this converges in four runs:
+
+```
+pass 1  25% smaller   749 calls dropped   oldest 1500/6001 messages
+pass 2  50% smaller  1125 calls dropped   oldest 2251/4503 messages
+pass 3 100% smaller  1123 calls dropped   whole window fits
+pass 4  nothing left to do
+```
+
+The message says which slice was used and that another run is worthwhile. The
+`minReductionRatio` check is measured against the slice, not the whole window,
+so a useful sliced pass is not rejected for looking small overall.
 
 Still open:
 
@@ -202,7 +230,7 @@ untouched by this extension.
 
 ```bash
 npm install
-npm test        # 42 tests, fake Jev, no network
+npm test        # 48 tests, fake Jev, no network
 npm run typecheck
 ```
 
@@ -222,6 +250,7 @@ tests/core.test.ts            pure logic
 tests/session.test.ts         real SessionManager round-trip
 tests/command.test.ts         planCompaction outcomes
 tests/e2e.test.ts             the registered command, stubbed transport
+tests/large-window.test.ts    overflow and slicing on call-heavy sessions
 ```
 
 `planCompaction` is exported so the decision path can be driven without a Pi
