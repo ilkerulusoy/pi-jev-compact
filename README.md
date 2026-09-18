@@ -5,10 +5,11 @@ Jev model. Jev scores every tool call and its result; calls that are no longer
 needed are dropped, the rest stays verbatim. No LLM writes a summary of your
 conversation.
 
-**Status: implemented, 85 tests passing, never run against a live Jev.** Every
-test uses a fake Jev or a stubbed transport, so the request shape and the
-decision logic are exercised but no real model judgment has been observed. The
-first live run is still ahead.
+**Status: implemented, 85 tests passing, run against live Jev.** Every test uses a
+fake Jev or a stubbed transport, so no test observes real model judgment. Live
+runs have compacted real sessions, but the quality of Jev's keep and drop
+decisions has not been measured against any reference. Read the section on the
+context indicator before judging a run by the footer percentage.
 
 Independent project. Not affiliated with TypeSafe AI or the Pi authors.
 
@@ -255,6 +256,42 @@ what was sent before accepting that none of the output was worth keeping.
 Reports are written to `$TMPDIR/pi-jev-compact/` with mode 0600, because they
 contain a sample of your transcript. They are not cleaned up automatically.
 
+## The context indicator does not drop, and why
+
+**Known limitation, not fixed.** Messages really are removed and the new session
+really is smaller, but Pi's context percentage in the footer can stay where it
+was. The two measure different things.
+
+Pi's `estimateContextTokens` does not count the transcript. It walks backwards to
+the last assistant message that carries a `usage` field, takes the number that
+API response reported, and estimates only the messages after it
+(`dist/core/compaction/compaction.js`). The replay copies assistant messages with
+spread syntax, so `usage` travels into the new session even when the content
+around it was pruned. The indicator then reads that stale number.
+
+Measured directly against the installed Pi 0.85.1:
+
+| History | Reported tokens |
+| --- | --- |
+| A `usage: { input: 300000 }` assistant message plus two short messages | 300,502 |
+| The same three messages with no `usage` field | 3 |
+
+Same content, and the only difference is whether a `usage` field is present.
+
+Pi's own `ContextUsage` type says the same thing in its comment: tokens are
+`null` "right after compaction, before next LLM response". Pi does not know the
+size of its own context until the next API call answers.
+
+So after `/jev-compact`:
+
+- The saving is real, and the report's character counts are measured.
+- The footer percentage is not evidence either way until another request runs.
+- Dropping `usage` during replay would make the indicator honest, but `usage` is
+  also what session token totals are built from, so it is not obviously correct
+  to discard. That trade-off has not been resolved here.
+
+Judge a run by the report's before and after character counts, not by the footer.
+
 ## Sessions too large to describe in one request
 
 Jev has to see the whole window to judge any single call, so a very long session
@@ -285,19 +322,24 @@ so a useful sliced pass is not rejected for looking small overall.
 
 Still open:
 
-1. No live Jev call has been made. Decision quality is unmeasured; only the
-   request shape and the code paths are tested.
-2. Whether any provider adapter repairs unpaired tool calls. A correctly written
+1. Decision quality is unmeasured. Live runs have gone through a real session,
+   so the request shape and the code paths are exercised, but whether Jev's keep
+   and drop calls are the *right* ones has never been checked against a
+   reference.
+2. Whether to drop `usage` from replayed assistant messages, which would make
+   Pi's context indicator reflect the pruned transcript at the cost of the
+   session's token totals. See the section above; the trade-off is unresolved.
+3. Whether any provider adapter repairs unpaired tool calls. A correctly written
    pair survives; a deliberately broken one has not been pushed through a
    provider, which is why `validatePlan` refuses to write instead of relying on
    downstream repair.
-3. `ctx.newSession({ setup })` is exercised only through a stub. Its real
+4. `ctx.newSession({ setup })` is exercised only through a stub. Its real
    prompting behavior, and what `cancelled` means for a partially seeded
    session, are untested.
-4. Whether `ctx.fork(entryId, { withSession })` is a better seam.
-5. `thinking` parts, `bashExecution` messages, and image content in replay.
-6. Whether to depend on `pi-typesafe` for request validation and byte limits.
-7. The token estimator is inherited from fast-jev-compaction and has not been
+5. Whether `ctx.fork(entryId, { withSession })` is a better seam.
+6. `thinking` parts, `bashExecution` messages, and image content in replay.
+7. Whether to depend on `pi-typesafe` for request validation and byte limits.
+8. The token estimator is inherited from fast-jev-compaction and has not been
    calibrated against Jev's own reported counts here.
 
 ## Safety rules
