@@ -83,15 +83,34 @@ export function collectLiveWindow(branchEntries: readonly any[]): LiveWindow {
   return window;
 }
 
-/** The last few user prompts, used as the `goal` field of the Jev state. */
-export function goalFrom(messages: readonly LiveMessage[], limit = 3): string {
+/**
+ * The `goal` field of the Jev state: what the user is trying to do.
+ *
+ * Both ends of the window matter and for different reasons. The first prompt is
+ * usually the actual task, and in a long session it is the one that explains why
+ * an old tool call still matters. The newest prompts say where the work is now.
+ * Taking only the tail loses the task; taking only the head loses the direction.
+ */
+export function goalFrom(messages: readonly LiveMessage[], recent = 3): string {
   const prompts: string[] = [];
   for (const { message } of messages) {
     if (message?.role !== "user") continue;
     const text = textOf(message.content).trim();
     if (text) prompts.push(text.slice(0, 500));
   }
-  return prompts.slice(-limit).join("\n");
+  if (prompts.length === 0) return "";
+
+  const tail = prompts.slice(-recent);
+  const first = prompts[0]!;
+  if (tail.includes(first)) return tail.join("\n");
+  const skipped = prompts.length - tail.length - 1;
+  return [
+    `first request: ${first}`,
+    skipped > 0 ? `[… ${skipped} intermediate request(s) omitted …]` : "",
+    `latest request(s):\n${tail.join("\n")}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 /** Text of a message content field, which may be a string or a content array. */

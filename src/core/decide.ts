@@ -84,32 +84,64 @@ export function decideCall(
   return { ...base, action: "drop_call", reason: "call_dropped" };
 }
 
+export interface BatchOutcome {
+  answers: Map<string, CallAnswer>;
+  /** What the model reported for this request, when it reported anything. */
+  model?: string;
+  inputTokens: number;
+  outputTokens: number;
+  elapsedMs: number;
+  questions: number;
+}
+
 async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
+): Promise<BatchOutcome> {
   const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
+  const started = Date.now();
+  const response = await asker.ask(state, questions);
+  const elapsedMs = Date.now() - started;
+  const answers = new Map(
     batch.map((call) => [
       call.id,
       {
-        keepCall: noulOf(answers, `call_${call.id}`),
-        keepResult: noulOf(answers, `result_${call.id}`),
+        keepCall: noulOf(response.answers, `call_${call.id}`),
+        keepResult: noulOf(response.answers, `result_${call.id}`),
       },
     ]),
   );
+  return {
+    answers,
+    ...(response.model ? { model: response.model } : {}),
+    inputTokens: response.usage?.input_tokens ?? 0,
+    outputTokens: response.usage?.output_tokens ?? 0,
+    elapsedMs,
+    questions: Object.keys(questions).length,
+  };
 }
 
 export interface ScoreResult {
   decisions: CallDecision[];
   requests: number;
+  /** Distinct model names that answered, as reported by the API. */
+  models: string[];
+  inputTokens: number;
+  outputTokens: number;
+  questionsAsked: number;
+  /** Wall clock for the whole scoring step; batches run concurrently. */
+  elapsedMs: number;
+  /** Slowest single request, which is closer to the per-judgment latency. */
+  slowestRequestMs: number;
 }
 
 /**
  * Score every call. Pinned calls are decided locally and never sent. A failure
  * from Jev propagates: the caller must write nothing in that case.
+ *
+ * Token counts and timings come back with the decisions so the caller can show
+ * what the run actually cost rather than asserting that it worked.
  */
 export async function scoreCalls(
   calls: readonly ToolCall[],
@@ -120,17 +152,39 @@ export async function scoreCalls(
 ): Promise<ScoreResult> {
   const candidates = calls.filter((call) => !call.pinned);
   const answers = new Map<string, CallAnswer>();
+  const models = new Set<string>();
   let requests = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let questionsAsked = 0;
+  let slowestRequestMs = 0;
+  const started = Date.now();
 
   if (candidates.length > 0) {
     const batches = batchCalls(candidates, stateTokens, settings.maxRequestTokens);
     requests = batches.length;
-    const answered = await Promise.all(batches.map((batch) => askBatch(asker, state, batch)));
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    const outcomes = await Promise.all(batches.map((batch) => askBatch(asker, state, batch)));
+    for (const outcome of outcomes) {
+      for (const [id, answer] of outcome.answers) answers.set(id, answer);
+      if (outcome.model) models.add(outcome.model);
+      inputTokens += outcome.inputTokens;
+      outputTokens += outcome.outputTokens;
+      questionsAsked += outcome.questions;
+      slowestRequestMs = Math.max(slowestRequestMs, outcome.elapsedMs);
+    }
   }
 
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, settings.keepThreshold),
   );
-  return { decisions, requests };
+  return {
+    decisions,
+    requests,
+    models: [...models],
+    inputTokens,
+    outputTokens,
+    questionsAsked,
+    elapsedMs: Date.now() - started,
+    slowestRequestMs,
+  };
 }

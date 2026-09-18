@@ -107,14 +107,42 @@ test("live window keeps custom_message and branch_summary, drops non-context ent
   ]);
 });
 
-test("goal uses the last user prompts only", () => {
+test("goal keeps the first request as well as the latest ones", () => {
   const window = collectLiveWindow([
     user("e1", "first"),
     assistant("e2", "noise"),
     user("e3", "second"),
     user("e4", "third"),
   ]);
-  assert.equal(goalFrom(window.messages, 2), "second\nthird");
+  const goal = goalFrom(window.messages, 2);
+  // The first request is what explains why an old call still matters, so it
+  // survives even when it falls outside the recent window.
+  assert.match(goal, /first request: first/);
+  assert.match(goal, /latest request\(s\):\nsecond\nthird/);
+});
+
+test("goal does not repeat the first request when it is already recent", () => {
+  const window = collectLiveWindow([user("e1", "only"), assistant("e2", "x")]);
+  assert.equal(goalFrom(window.messages, 3), "only");
+});
+
+test("goal notes how many middle requests were omitted", () => {
+  const window = collectLiveWindow([
+    user("e1", "task"),
+    user("e2", "mid a"),
+    user("e3", "mid b"),
+    user("e4", "mid c"),
+    user("e5", "now"),
+  ]);
+  const goal = goalFrom(window.messages, 1);
+  assert.match(goal, /first request: task/);
+  assert.match(goal, /3 intermediate request\(s\) omitted/);
+  assert.match(goal, /latest request\(s\):\nnow/);
+});
+
+test("goal is empty when there are no user prompts", () => {
+  const window = collectLiveWindow([assistant("e1", "only assistant text")]);
+  assert.equal(goalFrom(window.messages), "");
 });
 
 // ── pairing and pinning ────────────────────────────────────────────────────

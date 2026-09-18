@@ -5,7 +5,7 @@ Jev model. Jev scores every tool call and its result; calls that are no longer
 needed are dropped, the rest stays verbatim. No LLM writes a summary of your
 conversation.
 
-**Status: implemented, 48 tests passing, never run against a live Jev.** Every
+**Status: implemented, 60 tests passing, never run against a live Jev.** Every
 test uses a fake Jev or a stubbed transport, so the request shape and the
 decision logic are exercised but no real model judgment has been observed. The
 first live run is still ahead.
@@ -148,7 +148,7 @@ Established by reading source only:
 - `appendMessage` performs no pairing, ordering, or content validation.
 - `convertToLlm` is an elementwise type mapper with no pairing logic.
 
-Covered by the test suite (48 tests, `npm test`):
+Covered by the test suite (60 tests, `npm test`):
 
 - Live-window collection, including orphan recovery when `firstKeptEntryId` is
   empty or missing, and skipping entry kinds that do not reach context.
@@ -165,6 +165,46 @@ Covered by the test suite (48 tests, `npm test`):
   and confirm `toolCall.id` still matches `toolResult.toolCallId`.
 - Refusal paths: HTTP failure, malformed answers, declined confirmation, report
   mode, a cancelled session, and a missing key. Each writes nothing.
+
+## Checking what a run actually did
+
+Every run logs its own evidence before it does anything else, so a summary line
+is never the only thing you have to go on:
+
+```
+jev: 4 request(s), 474 questions, model jev-1.13.0
+tokens: 7280 in, 1072 out
+time: 34 ms total, slowest request 31 ms (batches run concurrently)
+state sent: ~21201 estimated tokens at stage 'full', tool output replaced by notes
+keepResult spread: 203 below 0.30, 0 between, 34 at or above 0.70 (threshold 0.5)
+chars: 965695 before, 162805 after, 83% smaller
+goal sent to jev: fix the login redirect bug
+now run the tests
+t1 read drop_result call=0.85 result=0.12
+t2 read drop_call  call=0.12 result=0.12
+```
+
+Where each number comes from:
+
+| Line | Source |
+| --- | --- |
+| requests, questions | Counted locally before sending |
+| model | The `model` field of the response. `(not reported)` when absent |
+| tokens | The `usage` field of the response. `0` when the API omits it, never estimated |
+| time | Measured around each request. Batches run concurrently, so total is not the sum |
+| state sent | The local estimate that drove the fitting decision, plus which stage was reached |
+| keepResult spread | The returned probabilities, bucketed |
+| chars | Counted on the transcript before and after planning |
+| per-call lines | Both probabilities behind each decision |
+
+The state token figure is an estimate from character counts, not a tokenizer, so
+compare it against the reported input tokens rather than trusting it directly.
+
+A run where nothing scored at or above 0.70 adds an explicit note. That is worth
+reading: it usually means the goal line did not describe the work well, so check
+what was sent before accepting that none of the output was worth keeping.
+
+`/jev-compact report` prints all of this and writes nothing.
 
 ## Sessions too large to describe in one request
 
@@ -230,7 +270,7 @@ untouched by this extension.
 
 ```bash
 npm install
-npm test        # 48 tests, fake Jev, no network
+npm test        # 60 tests, fake Jev, no network
 npm run typecheck
 ```
 
@@ -251,6 +291,7 @@ tests/session.test.ts         real SessionManager round-trip
 tests/command.test.ts         planCompaction outcomes
 tests/e2e.test.ts             the registered command, stubbed transport
 tests/large-window.test.ts    overflow and slicing on call-heavy sessions
+tests/evidence.test.ts        reported tokens, timings, model, score spread
 ```
 
 `planCompaction` is exported so the decision path can be driven without a Pi

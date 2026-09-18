@@ -23,11 +23,22 @@ export interface RunOutcome {
     stateTokens: number;
     stateStage: string;
     requests: number;
+    /** Model names the API reported. Empty means nothing was asked. */
+    models: string[];
+    inputTokens: number;
+    outputTokens: number;
+    questionsAsked: number;
+    elapsedMs: number;
+    slowestRequestMs: number;
+    /** Distribution of keepResult, to show what the scores looked like. */
+    scoreBuckets: { low: number; mid: number; high: number };
     scopedTo?: number;
     totalCalls?: number;
     totalMessages?: number;
   };
   plan?: any[];
+  /** The goal line that was sent as part of the state, for inspection. */
+  goal?: string;
 }
 
 const count = (decisions: readonly CallDecision[], reason: CallDecision["reason"]): number =>
@@ -71,13 +82,14 @@ export async function planCompaction(
   let scoped = window.messages;
   let scopedCalls = calls;
   let slicedFrom: number | undefined;
+  const goal = goalFrom(window.messages);
 
   for (;;) {
     try {
       fitted = fitState(scoped, scopedCalls, {
         maxStateTokens: settings.maxStateTokens,
         preserveRecentMessages: scoped === window.messages ? settings.preserveRecentMessages : 0,
-        goal: goalFrom(window.messages),
+        goal,
       });
       break;
     } catch (error) {
@@ -128,6 +140,12 @@ export async function planCompaction(
   }
 
   const reduction = reductionRatio(plan);
+  const scored_ = scored.decisions.filter((d) => d.reason !== "pinned");
+  const scoreBuckets = {
+    low: scored_.filter((d) => d.keepResult < 0.3).length,
+    mid: scored_.filter((d) => d.keepResult >= 0.3 && d.keepResult < 0.7).length,
+    high: scored_.filter((d) => d.keepResult >= 0.7).length,
+  };
   const stats = {
     calls: scopedCalls.length,
     kept: count(scored.decisions, "kept"),
@@ -140,6 +158,13 @@ export async function planCompaction(
     stateTokens: fitted.tokens,
     stateStage: fitted.stage,
     requests: scored.requests,
+    models: scored.models,
+    inputTokens: scored.inputTokens,
+    outputTokens: scored.outputTokens,
+    questionsAsked: scored.questionsAsked,
+    elapsedMs: scored.elapsedMs,
+    slowestRequestMs: scored.slowestRequestMs,
+    scoreBuckets,
     ...(slicedFrom === undefined
       ? {}
       : { scopedTo: slicedFrom, totalCalls: calls.length, totalMessages: window.messages.length }),
@@ -166,6 +191,7 @@ export async function planCompaction(
       message: `pi-jev-compact: not worth it, ${summary}. Nothing written.`,
       decisions: scored.decisions,
       stats,
+      goal,
     };
   }
 
@@ -175,6 +201,7 @@ export async function planCompaction(
     decisions: scored.decisions,
     stats,
     plan: plan.messages,
+    goal,
   };
 }
 
@@ -185,6 +212,54 @@ export function decisionLines(decisions: readonly CallDecision[]): string[] {
       (d) =>
         `${d.id} ${d.tool} ${d.action} call=${d.keepCall.toFixed(2)} result=${d.keepResult.toFixed(2)}`,
     );
+}
+
+/**
+ * The evidence that a run actually happened and what it cost. Reports measured
+ * values only: token counts and the model name come from the API response, and
+ * an absent `usage` shows as 0 rather than an estimate.
+ */
+export function evidenceLines(outcome: RunOutcome, settings: Settings): string[] {
+  const s = outcome.stats;
+  if (!s) return ["pi-jev-compact: nothing was sent to Jev."];
+
+  const lines: string[] = [];
+  if (s.requests === 0) {
+    lines.push("jev: no request sent (every call was pinned or the window was too small)");
+  } else {
+    const model = s.models.length ? s.models.join(", ") : "(not reported)";
+    lines.push(
+      `jev: ${s.requests} request(s), ${s.questionsAsked} questions, model ${model}`,
+    );
+    lines.push(
+      `tokens: ${s.inputTokens} in, ${s.outputTokens} out${
+        s.inputTokens === 0 ? " (usage not reported by the API)" : ""
+      }`,
+    );
+    lines.push(
+      `time: ${s.elapsedMs} ms total, slowest request ${s.slowestRequestMs} ms (batches run concurrently)`,
+    );
+    lines.push(
+      `state sent: ~${s.stateTokens} estimated tokens at stage '${s.stateStage}', tool output replaced by notes`,
+    );
+    lines.push(
+      `keepResult spread: ${s.scoreBuckets.low} below 0.30, ${s.scoreBuckets.mid} between, ${s.scoreBuckets.high} at or above 0.70 (threshold ${settings.keepThreshold})`,
+    );
+  }
+  lines.push(
+    `chars: ${s.charsBefore} before, ${s.charsAfter} after, ${percent(s.reduction)} smaller`,
+  );
+  if (s.scopedTo !== undefined) {
+    lines.push(
+      `scope: oldest ${s.scopedTo} of ${s.totalMessages} messages, ${s.calls} of ${s.totalCalls} calls scored`,
+    );
+  }
+  if (s.requests > 0 && s.scoreBuckets.high === 0 && s.scoreBuckets.low > 0) {
+    lines.push(
+      "note: no result scored at or above 0.70, so Jev judged none of them worth keeping verbatim. Check the goal line above if that looks wrong.",
+    );
+  }
+  return lines;
 }
 
 export function registerJevCompactCommand(pi: any): void {
@@ -210,6 +285,11 @@ export function registerJevCompactCommand(pi: any): void {
         settings,
       );
 
+      // Evidence first, so it is visible whether or not the run goes on to write.
+      for (const line of evidenceLines(outcome, settings)) ctx.ui.log?.(line);
+      if (outcome.goal !== undefined) {
+        ctx.ui.log?.(`goal sent to jev: ${outcome.goal.slice(0, 300) || "(empty)"}`);
+      }
       if (outcome.decisions?.length) {
         for (const line of decisionLines(outcome.decisions)) ctx.ui.log?.(line);
       }
