@@ -5,7 +5,7 @@ Jev model. Jev scores every tool call and its result; calls that are no longer
 needed are dropped, the rest stays verbatim. No LLM writes a summary of your
 conversation.
 
-**Status: implemented, 60 tests passing, never run against a live Jev.** Every
+**Status: implemented, 69 tests passing, never run against a live Jev.** Every
 test uses a fake Jev or a stubbed transport, so the request shape and the
 decision logic are exercised but no real model judgment has been observed. The
 first live run is still ahead.
@@ -148,7 +148,7 @@ Established by reading source only:
 - `appendMessage` performs no pairing, ordering, or content validation.
 - `convertToLlm` is an elementwise type mapper with no pairing logic.
 
-Covered by the test suite (60 tests, `npm test`):
+Covered by the test suite (69 tests, `npm test`):
 
 - Live-window collection, including orphan recovery when `firstKeptEntryId` is
   empty or missing, and skipping entry kinds that do not reach context.
@@ -168,21 +168,44 @@ Covered by the test suite (60 tests, `npm test`):
 
 ## Checking what a run actually did
 
-Every run logs its own evidence before it does anything else, so a summary line
-is never the only thing you have to go on:
+Every run writes a self-contained HTML report and puts its path in the
+notification. Pi's `ExtensionUIContext` has no `log` method, so per-call detail
+cannot go to the transcript; the report is where it lives. A failed run gets one
+too, which is when the request body matters most.
+
+The report contains:
+
+- **Every request and response verbatim**, with URL, status, duration, and bytes
+  sent. This is how you confirm a request went out at all. The API key travels
+  in a header and is never recorded.
+- **One row per call**: tool, arguments, result size, characters freed, both
+  probabilities drawn against the threshold, the outcome, and a preview of the
+  result being dropped. Rows are red for removed, yellow for truncated, green
+  for kept, with a filter box.
+- **The goal** Jev judged against, and a sample of the `history` it received.
+- **Run statistics** and the highest and lowest scoring calls.
+
+A sample row reads:
 
 ```
-jev: 4 request(s), 474 questions, model jev-1.13.0
-tokens: 7280 in, 1072 out
-time: 34 ms total, slowest request 31 ms (batches run concurrently)
-state sent: ~21201 estimated tokens at stage 'full', tool output replaced by notes
-keepResult spread: 203 below 0.30, 0 between, 34 at or above 0.70 (threshold 0.5)
-chars: 965695 before, 162805 after, 83% smaller
-goal sent to jev: fix the login redirect bug
-now run the tests
-t1 read drop_result call=0.85 result=0.12
-t2 read drop_call  call=0.12 result=0.12
+t1  bash  command=npm test -- auth  3,024  −2,724
+    keepCall  ██████████████████·· 0.88
+    keepResult ██·················· 0.11   → result truncated
+    preview: output line for call 1: xxxxxxxxxx…
 ```
+
+The orange tick in each bar marks the threshold, so a decision that only just
+went one way is visible at a glance.
+
+The notification itself is short, and states how many requests were sent:
+
+```
+pi-jev-compact: 83% smaller; 34 kept, 34 results truncated, 169 calls dropped,
+0 pinned; state ~21201 tok (full) in 4 request(s). 4 request(s) sent.
+Report: /tmp/pi-jev-compact/report-2026-02-14T09-31-07-412Z.html
+```
+
+The same figures are in the report's header cards. Where each comes from:
 
 Where each number comes from:
 
@@ -204,7 +227,10 @@ A run where nothing scored at or above 0.70 adds an explicit note. That is worth
 reading: it usually means the goal line did not describe the work well, so check
 what was sent before accepting that none of the output was worth keeping.
 
-`/jev-compact report` prints all of this and writes nothing.
+`/jev-compact report` produces the full report and writes nothing to the session.
+
+Reports are written to `$TMPDIR/pi-jev-compact/` with mode 0600, because they
+contain a sample of your transcript. They are not cleaned up automatically.
 
 ## Sessions too large to describe in one request
 
@@ -270,7 +296,7 @@ untouched by this extension.
 
 ```bash
 npm install
-npm test        # 60 tests, fake Jev, no network
+npm test        # 69 tests, fake Jev, no network
 npm run typecheck
 ```
 
@@ -286,12 +312,15 @@ src/core/state.ts             state fitting ladder, token estimate
 src/core/jev.ts               POST /v1/systemone, response validation
 src/core/decide.ts            questions, batching, thresholds
 src/core/replay.ts            plan, truncation, and the pairing guard
+src/core/trace.ts             records requests and responses verbatim
+src/core/report.ts            the HTML report
 tests/core.test.ts            pure logic
 tests/session.test.ts         real SessionManager round-trip
 tests/command.test.ts         planCompaction outcomes
 tests/e2e.test.ts             the registered command, stubbed transport
 tests/large-window.test.ts    overflow and slicing on call-heavy sessions
 tests/evidence.test.ts        reported tokens, timings, model, score spread
+tests/report.test.ts          HTML report contents, escaping, file permissions
 ```
 
 `planCompaction` is exported so the decision path can be driven without a Pi

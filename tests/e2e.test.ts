@@ -153,8 +153,14 @@ test("the full command path writes a pruned session after confirmation", async (
     assert.deepEqual(callIds, ["tc_1", "tc_3"], "selective removal reached the session writer");
     assert.deepEqual(resultIds, ["tc_1", "tc_3"]);
 
-    assert.ok(h.logs.some((l) => l.startsWith("t2 read drop_call")), "decisions are logged");
+    // Pi's ExtensionUIContext has no log method, so the per-call detail goes to an
+    // HTML report and the notification carries its path.
     assert.ok(h.notes.some((n) => n.includes("wrote a compacted session")));
+    assert.ok(
+      h.notes.some((n) => n.includes("Report:") && n.includes(".html")),
+      "the report path is shown so the decisions can be inspected",
+    );
+    assert.ok(h.notes.some((n) => n.includes("request(s) sent")), "request count is stated");
   });
 });
 
@@ -173,7 +179,11 @@ test("report mode never asks and never writes", async () => {
     await h.run("report");
     assert.equal(h.confirmations.length, 0);
     assert.equal(h.newSessionCalls, 0);
-    assert.ok(h.notes.some((n) => n.includes("Report only, nothing written")));
+    assert.ok(h.notes.some((n) => n.includes("Nothing written")));
+    assert.ok(
+      h.notes.some((n) => n.includes("Report:") && n.includes(".html")),
+      "report mode still produces an inspectable report",
+    );
   });
 });
 

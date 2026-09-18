@@ -3,9 +3,11 @@ import { collectToolCalls, messageChars } from "../core/tool-calls";
 import { scoreCalls } from "../core/decide";
 import { fitState, StateTooLargeError } from "../core/state";
 import { planReplay, reductionRatio, validatePlan } from "../core/replay";
-import { JevClient, resolveApiKey } from "../core/jev";
+import { JevClient, SYSTEM_ONE_URL, resolveApiKey } from "../core/jev";
+import { TracingAsker, stamp, writeOwnerOnly } from "../core/trace";
+import { renderHtmlReport } from "../core/report";
 import { DEFAULT_SETTINGS } from "../types";
-import type { CallDecision, JevAsker, Settings } from "../types";
+import type { CallDecision, JevAsker, LiveMessage, Settings, ToolCall } from "../types";
 
 export interface RunOutcome {
   status: "ok" | "nothing_to_do" | "below_threshold" | "unsafe" | "error";
@@ -39,6 +41,12 @@ export interface RunOutcome {
   plan?: any[];
   /** The goal line that was sent as part of the state, for inspection. */
   goal?: string;
+  /** Calls actually scored, parallel to `decisions`, for the report. */
+  scoredCalls?: ToolCall[];
+  /** The live window the decisions were made against. */
+  window?: LiveMessage[];
+  /** First part of the fitted history, so the report can show what Jev saw. */
+  stateSample?: string;
 }
 
 const count = (decisions: readonly CallDecision[], reason: CallDecision["reason"]): number =>
@@ -118,6 +126,9 @@ export async function planCompaction(
     }
   }
 
+  // A readable slice of the history Jev received, for the report.
+  const stateSample = JSON.stringify(fitted.state.history.slice(0, 12), null, 2).slice(0, 4000);
+
   let scored;
   try {
     scored = await scoreCalls(scopedCalls, fitted.state, fitted.tokens, asker, settings);
@@ -192,6 +203,9 @@ export async function planCompaction(
       decisions: scored.decisions,
       stats,
       goal,
+      scoredCalls: scopedCalls,
+      window: scoped,
+      stateSample,
     };
   }
 
@@ -202,6 +216,9 @@ export async function planCompaction(
     stats,
     plan: plan.messages,
     goal,
+    scoredCalls: scopedCalls,
+    window: scoped,
+    stateSample,
   };
 }
 
@@ -279,38 +296,63 @@ export function registerJevCompactCommand(pi: any): void {
       }
 
       const branchEntries = ctx.sessionManager.buildContextEntries();
-      const outcome = await planCompaction(
-        branchEntries,
+      // Record every request and response so the run can be inspected afterwards.
+      const tracer = new TracingAsker(
         new JevClient({ apiKey, model: settings.model }),
-        settings,
+        SYSTEM_ONE_URL,
       );
 
-      // Evidence first, so it is visible whether or not the run goes on to write.
-      for (const line of evidenceLines(outcome, settings)) ctx.ui.log?.(line);
-      if (outcome.goal !== undefined) {
-        ctx.ui.log?.(`goal sent to jev: ${outcome.goal.slice(0, 300) || "(empty)"}`);
-      }
-      if (outcome.decisions?.length) {
-        for (const line of decisionLines(outcome.decisions)) ctx.ui.log?.(line);
+      let outcome: RunOutcome;
+      try {
+        outcome = await planCompaction(branchEntries, tracer, settings);
+      } catch (error) {
+        outcome = { status: "error", message: `pi-jev-compact: ${(error as Error).message}` };
       }
 
+      // Pi's ExtensionUIContext has no log method, so the evidence goes to a file
+      // and the path is shown. A failed run still gets a report: that is when the
+      // request and response bodies matter most.
+      const html = renderHtmlReport({
+        decisions: outcome.decisions ?? [],
+        calls: outcome.scoredCalls ?? [],
+        messages: outcome.window ?? [],
+        trace: tracer.entries,
+        goal: outcome.goal ?? "",
+        settings,
+        stats: (outcome.stats ?? {}) as Record<string, unknown>,
+        stateSample: outcome.stateSample ?? "(no state was built)",
+        written: false,
+      });
+      let reportPath: string | undefined;
+      try {
+        reportPath = writeOwnerOnly(`report-${stamp()}.html`, html);
+      } catch {
+        reportPath = undefined;
+      }
+
+      const where = reportPath ? `\nReport: ${reportPath}` : "";
+      const sent = `${tracer.entries.length} request(s) sent`;
+
       if (outcome.status !== "ok") {
-        ctx.ui.notify(outcome.message, outcome.status === "error" || outcome.status === "unsafe" ? "error" : "info");
+        ctx.ui.notify(
+          `${outcome.message} ${sent}.${where}`,
+          outcome.status === "error" || outcome.status === "unsafe" ? "error" : "info",
+        );
         return;
       }
 
       if (report) {
-        ctx.ui.notify(`${outcome.message} Report only, nothing written.`, "info");
+        ctx.ui.notify(`${outcome.message} ${sent}. Nothing written.${where}`, "info");
         return;
       }
 
       const plan = outcome.plan!;
       const confirmed = await ctx.ui.confirm(
         "Write a compacted copy of this session?",
-        `${outcome.message}\n\nA new session file is created with ${plan.length} messages. The current session file is not modified. Dropped tool results are gone from the new session; the assistant can re-run those tools.`,
+        `${outcome.message}\n\nA new session file is created with ${plan.length} messages. The current session file is not modified. Dropped tool results are gone from the new session; the assistant can re-run those tools.${where}`,
       );
       if (!confirmed) {
-        ctx.ui.notify("pi-jev-compact: cancelled, nothing written.", "info");
+        ctx.ui.notify(`pi-jev-compact: cancelled, nothing written.${where}`, "info");
         return;
       }
 
@@ -319,10 +361,31 @@ export function registerJevCompactCommand(pi: any): void {
           for (const message of plan) sessionManager.appendMessage(message);
         },
       });
+      if (!cancelled && reportPath) {
+        // Rewrite the report now that the outcome is known.
+        try {
+          writeOwnerOnly(
+            reportPath.split("/").pop()!,
+            renderHtmlReport({
+              decisions: outcome.decisions ?? [],
+              calls: outcome.scoredCalls ?? [],
+              messages: outcome.window ?? [],
+              trace: tracer.entries,
+              goal: outcome.goal ?? "",
+              settings,
+              stats: (outcome.stats ?? {}) as Record<string, unknown>,
+              stateSample: outcome.stateSample ?? "",
+              written: true,
+            }),
+          );
+        } catch {
+          // The report is a convenience; a failure here must not affect the session.
+        }
+      }
       ctx.ui.notify(
         cancelled
-          ? "pi-jev-compact: new session was cancelled."
-          : `pi-jev-compact: wrote a compacted session with ${plan.length} messages. ${outcome.message}`,
+          ? `pi-jev-compact: new session was cancelled.${where}`
+          : `pi-jev-compact: wrote a compacted session with ${plan.length} messages. ${outcome.message} ${sent}.${where}`,
         cancelled ? "warning" : "info",
       );
     },
