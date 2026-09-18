@@ -92,12 +92,24 @@ const harness = (options: {
         sessionManager: {
           buildContextEntries: () => options.branchEntries ?? branch(),
         },
-        newSession: async ({ setup }: any) => {
+        // Mirrors pi: setup seeds the new SessionManager, then withSession runs
+        // against a fresh context. The original ctx is stale from here onward, so
+        // the stub deliberately does not offer it to post-replacement code.
+        newSession: async ({ setup, withSession }: any) => {
           h.newSessionCalls++;
           const written: any[] = [];
           await setup({ appendMessage: (m: any) => written.push(m) });
           h.appended.push(written);
-          return { cancelled: options.cancelled === true };
+          const cancelled = options.cancelled === true;
+          if (!cancelled && withSession) {
+            await withSession({
+              ui: {
+                notify: (m: string, level = "info") => h.notes.push(`[${level}] ${m}`),
+                confirm: async () => true,
+              },
+            });
+          }
+          return { cancelled };
         },
       });
     },
@@ -225,4 +237,73 @@ test("without a key nothing is sent and nothing is written", async () => {
   } finally {
     if (saved !== undefined) process.env.TYPESAFE_API_KEY = saved;
   }
+});
+
+test("the stale command ctx is never touched after the session is replaced", async () => {
+  await withKey(async () => {
+    const registered: any[] = [];
+    registerJevCompactCommand({
+      registerCommand: (name: string, def: any) => registered.push({ name, ...def }),
+    });
+
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      const answers: Record<string, { noul: number }> = {};
+      for (const name of Object.keys(body.questions)) {
+        answers[name] = { noul: name.startsWith("call_") ? 0.9 : 0.1 };
+      }
+      return { status: 200, ok: true, text: async () => JSON.stringify({ model: "m", answers }) };
+    }) as any;
+
+    // Pi raises "stale after session replacement or reload" if the captured ctx is
+    // used once newSession has replaced the session. This stub makes that a test
+    // failure instead of a runtime error a user has to discover.
+    let replaced = false;
+    const staleUses: string[] = [];
+    const guardedUi = {
+      notify: (m: string) => {
+        if (replaced) staleUses.push(`notify: ${m}`);
+      },
+      confirm: async () => {
+        if (replaced) staleUses.push("confirm");
+        return true;
+      },
+    };
+
+    const freshNotes: string[] = [];
+    await registered[0].handler("", {
+      ui: guardedUi,
+      sessionManager: {
+        buildContextEntries: () => {
+          if (replaced) staleUses.push("buildContextEntries");
+          return branch();
+        },
+      },
+      newSession: async ({ setup, withSession }: any) => {
+        await setup({ appendMessage: () => {} });
+        replaced = true;
+        await withSession({ ui: { notify: (m: string) => freshNotes.push(m) } });
+        return { cancelled: false };
+      },
+    });
+
+    assert.deepEqual(staleUses, [], "nothing may use the old ctx after replacement");
+    assert.ok(
+      freshNotes.some((n) => n.includes("wrote a compacted session")),
+      "the result is reported through the replacement-session ctx",
+    );
+  });
+});
+
+test("a cancelled new session reports on the still-live original ctx", async () => {
+  await withKey(async () => {
+    const h = harness({
+      answers: { t1: [0.9, 0.9], t2: [0.1, 0.1], t3: [0.9, 0.1] },
+      cancelled: true,
+    });
+    await h.run();
+    // withSession does not run when the replacement is cancelled, so the original
+    // ctx is still the live one and is the only place left to report.
+    assert.ok(h.notes.some((n) => n.includes("[warning]") && n.includes("cancelled")));
+  });
 });

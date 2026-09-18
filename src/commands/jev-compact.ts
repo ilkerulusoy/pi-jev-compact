@@ -356,38 +356,46 @@ export function registerJevCompactCommand(pi: any): void {
         return;
       }
 
+      const written = `pi-jev-compact: wrote a compacted session with ${plan.length} messages. ${outcome.message} ${sent}.${where}`;
+
+      // Everything after the session is replaced must use the ctx handed to
+      // withSession. The captured command ctx is stale from newSession onward,
+      // and touching it raises "stale after session replacement or reload".
       const { cancelled } = await ctx.newSession({
         setup: async (sessionManager: any) => {
           for (const message of plan) sessionManager.appendMessage(message);
         },
+        withSession: async (fresh: any) => {
+          if (reportPath) {
+            // Rewrite the report now that the write is known to have happened.
+            try {
+              writeOwnerOnly(
+                reportPath.split("/").pop()!,
+                renderHtmlReport({
+                  decisions: outcome.decisions ?? [],
+                  calls: outcome.scoredCalls ?? [],
+                  messages: outcome.window ?? [],
+                  trace: tracer.entries,
+                  goal: outcome.goal ?? "",
+                  settings,
+                  stats: (outcome.stats ?? {}) as Record<string, unknown>,
+                  stateSample: outcome.stateSample ?? "",
+                  written: true,
+                }),
+              );
+            } catch {
+              // The report is a convenience; a failure must not affect the session.
+            }
+          }
+          fresh.ui.notify(written, "info");
+        },
       });
-      if (!cancelled && reportPath) {
-        // Rewrite the report now that the outcome is known.
-        try {
-          writeOwnerOnly(
-            reportPath.split("/").pop()!,
-            renderHtmlReport({
-              decisions: outcome.decisions ?? [],
-              calls: outcome.scoredCalls ?? [],
-              messages: outcome.window ?? [],
-              trace: tracer.entries,
-              goal: outcome.goal ?? "",
-              settings,
-              stats: (outcome.stats ?? {}) as Record<string, unknown>,
-              stateSample: outcome.stateSample ?? "",
-              written: true,
-            }),
-          );
-        } catch {
-          // The report is a convenience; a failure here must not affect the session.
-        }
+
+      // Only the cancelled branch is safe to report on the original ctx: the
+      // session was not replaced, so this ctx is still the live one.
+      if (cancelled) {
+        ctx.ui.notify(`pi-jev-compact: new session was cancelled.${where}`, "warning");
       }
-      ctx.ui.notify(
-        cancelled
-          ? `pi-jev-compact: new session was cancelled.${where}`
-          : `pi-jev-compact: wrote a compacted session with ${plan.length} messages. ${outcome.message} ${sent}.${where}`,
-        cancelled ? "warning" : "info",
-      );
     },
   });
 }

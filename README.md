@@ -5,7 +5,7 @@ Jev model. Jev scores every tool call and its result; calls that are no longer
 needed are dropped, the rest stays verbatim. No LLM writes a summary of your
 conversation.
 
-**Status: implemented, 69 tests passing, never run against a live Jev.** Every
+**Status: implemented, 71 tests passing, never run against a live Jev.** Every
 test uses a fake Jev or a stubbed transport, so the request shape and the
 decision logic are exercised but no real model judgment has been observed. The
 first live run is still ahead.
@@ -148,7 +148,7 @@ Established by reading source only:
 - `appendMessage` performs no pairing, ordering, or content validation.
 - `convertToLlm` is an elementwise type mapper with no pairing logic.
 
-Covered by the test suite (69 tests, `npm test`):
+Covered by the test suite (71 tests, `npm test`):
 
 - Live-window collection, including orphan recovery when `firstKeptEntryId` is
   empty or missing, and skipping entry kinds that do not reach context.
@@ -165,6 +165,9 @@ Covered by the test suite (69 tests, `npm test`):
   and confirm `toolCall.id` still matches `toolResult.toolCallId`.
 - Refusal paths: HTTP failure, malformed answers, declined confirmation, report
   mode, a cancelled session, and a missing key. Each writes nothing.
+- Session replacement: post-write reporting happens through the `withSession`
+  context, and a test fails if the captured command `ctx` is touched after the
+  session has been replaced.
 
 ## Checking what a run actually did
 
@@ -296,7 +299,7 @@ untouched by this extension.
 
 ```bash
 npm install
-npm test        # 69 tests, fake Jev, no network
+npm test        # 71 tests, fake Jev, no network
 npm run typecheck
 ```
 
