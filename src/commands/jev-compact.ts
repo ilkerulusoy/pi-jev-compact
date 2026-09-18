@@ -387,18 +387,20 @@ export function registerJevCompactCommand(pi: any): void {
       }
 
       const where = reportPath ? `\nReport: ${reportPath}` : "";
-      const sent = `${tracer.entries.length} request(s) sent`;
+      // Only stated when the summary cannot: a failed or refused run has no stats,
+      // so the request count is the only proof that something was attempted.
+      const sent = outcome.stats ? "" : ` ${tracer.entries.length} request(s) sent.`;
 
       if (outcome.status !== "ok") {
         ctx.ui.notify(
-          `${outcome.message} ${sent}.${where}`,
+          `${outcome.message}${sent}${where}`,
           outcome.status === "error" || outcome.status === "unsafe" ? "error" : "info",
         );
         return;
       }
 
       if (report) {
-        ctx.ui.notify(`${outcome.message} ${sent}. Nothing written.${where}`, "info");
+        ctx.ui.notify(`${outcome.message} Nothing written.${sent}${where}`, "info");
         return;
       }
 
@@ -412,7 +414,10 @@ export function registerJevCompactCommand(pi: any): void {
         return;
       }
 
-      const written = `pi-jev-compact: wrote a compacted session with ${plan.length} messages. ${outcome.message} ${sent}.${where}`;
+      // outcome.message already carries the prefix and the summary, including the
+      // request count, so this only adds what the summary does not know: that the
+      // write happened, and where the report is.
+      const written = `${outcome.message} Wrote ${plan.length} messages to a new session.${where}`;
 
       // Everything after the session is replaced must use the ctx handed to
       // withSession. The captured command ctx is stale from newSession onward,

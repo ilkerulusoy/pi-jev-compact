@@ -167,12 +167,23 @@ test("the full command path writes a pruned session after confirmation", async (
 
     // Pi's ExtensionUIContext has no log method, so the per-call detail goes to an
     // HTML report and the notification carries its path.
-    assert.ok(h.notes.some((n) => n.includes("wrote a compacted session")));
+    assert.ok(h.notes.some((n) => n.includes("Wrote") && n.includes("messages to a new session")));
     assert.ok(
       h.notes.some((n) => n.includes("Report:") && n.includes(".html")),
       "the report path is shown so the decisions can be inspected",
     );
-    assert.ok(h.notes.some((n) => n.includes("request(s) sent")), "request count is stated");
+    // The summary already carries the request count, so it must not be repeated.
+    const success = h.notes.find((n) => n.includes("messages to a new session"))!;
+    assert.equal(
+      (success.match(/request\(s\)/g) ?? []).length,
+      1,
+      `request count stated once, not twice: ${success}`,
+    );
+    assert.equal(
+      (success.match(/pi-jev-compact:/g) ?? []).length,
+      1,
+      `prefix appears once, not twice: ${success}`,
+    );
   });
 });
 
@@ -289,7 +300,7 @@ test("the stale command ctx is never touched after the session is replaced", asy
 
     assert.deepEqual(staleUses, [], "nothing may use the old ctx after replacement");
     assert.ok(
-      freshNotes.some((n) => n.includes("wrote a compacted session")),
+      freshNotes.some((n) => n.includes("messages to a new session")),
       "the result is reported through the replacement-session ctx",
     );
   });
