@@ -1,5 +1,5 @@
 import { messageChars } from "./tool-calls";
-import type { CallDecision, LiveMessage, Settings, ToolCall } from "../types";
+import type { CallDecision, LiveMessage, Settings, TextDecision, ToolCall } from "../types";
 
 /**
  * Roles that must never go through `appendMessage`.
@@ -60,7 +60,14 @@ export function planReplay(
   calls: readonly ToolCall[],
   decisions: readonly CallDecision[],
   settings: Pick<Settings, "truncateHeadChars">,
+  textDecisions: readonly TextDecision[] = [],
 ): PlanResult {
+  // Assistant prose to remove, by its index in the window. A message keeps its
+  // tool calls even when its text goes: the call is a separate decision, and
+  // orphaning a result is never acceptable.
+  const droppedText = new Set(
+    textDecisions.filter((d) => d.action === "drop_text").map((d) => d.messageIndex),
+  );
   const byShortId = new Map(calls.map((call) => [call.id, call]));
   const actionByToolCallId = new Map<string, CallDecision["action"]>();
   for (const decision of decisions) {
@@ -71,7 +78,7 @@ export function planReplay(
   const charsBefore = messages.reduce((sum, { message }) => sum + messageChars(message), 0);
   const survivors: any[] = [];
 
-  for (const { message } of messages) {
+  for (const [messageIndex, { message }] of messages.entries()) {
     if (!message) continue;
 
     if (message.role === "toolResult") {
@@ -93,10 +100,16 @@ export function planReplay(
     }
 
     if (message.role === "assistant" && Array.isArray(message.content)) {
-      const content = message.content.filter(
-        (part: any) =>
-          !(part?.type === "toolCall" && actionByToolCallId.get(part.id) === "drop_call"),
-      );
+      const dropText = droppedText.has(messageIndex);
+      const content = message.content.filter((part: any) => {
+        if (part?.type === "toolCall") {
+          return actionByToolCallId.get(part.id) !== "drop_call";
+        }
+        // Thinking blocks go with the prose they belong to; keeping them while
+        // removing the text around them leaves reasoning without its conclusion.
+        if (dropText && (part?.type === "text" || part?.type === "thinking")) return false;
+        return true;
+      });
       if (content.length === message.content.length) {
         survivors.push(message);
         continue;
@@ -105,6 +118,7 @@ export function planReplay(
       survivors.push({ ...message, content });
       continue;
     }
+
 
     survivors.push(message);
   }

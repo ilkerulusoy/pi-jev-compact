@@ -5,7 +5,7 @@ Jev model. Jev scores every tool call and its result; calls that are no longer
 needed are dropped, the rest stays verbatim. No LLM writes a summary of your
 conversation.
 
-**Status: implemented, 71 tests passing, never run against a live Jev.** Every
+**Status: implemented, 85 tests passing, never run against a live Jev.** Every
 test uses a fake Jev or a stubbed transport, so the request shape and the
 decision logic are exercised but no real model judgment has been observed. The
 first live run is still ahead.
@@ -18,9 +18,20 @@ Pi's built-in compaction asks an LLM to summarize old turns. A summary is lossy:
 an exact error string, a file path, a command, or a constraint can disappear
 right when it becomes relevant again.
 
-This extension never rewrites your messages. It asks Jev, per tool call, whether
-the call and whether its output still matter, then deletes what is no longer
-needed. User and assistant text is never removed or rephrased.
+Nothing is ever rewritten or paraphrased. Jev is asked, per tool call, whether
+the call and whether its output still matter, and what it says is no longer
+needed is deleted. What remains is byte-identical.
+
+By default only tool calls and their results are candidates, which is also the
+limit in both projects this design is taken from. That leaves a ceiling: in a
+long session the largest part of the context is assistant prose, so removing
+every tool result may still only reclaim a fraction of it. `/jev-compact text`
+adds prose to the candidates. Measured on a synthetic 1,860-message window,
+15.5% reclaimed became 33.5%.
+
+Prose is opt-in and held to a stricter threshold for one reason: a dropped tool
+result can be recovered by running the tool again, and dropped reasoning cannot
+be recovered at all. User messages are never candidates in either mode.
 
 Prior art this design is taken from, with thanks:
 
@@ -107,6 +118,8 @@ the command.
 | --- | --- |
 | `/jev-compact` | Score the live window, then write a pruned new session |
 | `/jev-compact report` | Score and report only; write nothing |
+| `/jev-compact text` | Also score assistant prose, not just tool calls |
+| `/jev-compact report text` | Both: score prose and write nothing |
 
 | Setting | Default | Description |
 | --- | --- | --- |
@@ -116,6 +129,9 @@ the command.
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one question batch |
 | `truncateHeadChars` | `300` | Characters of a dropped result retained before its note |
 | `minReductionRatio` | `0.25` | Below this estimated saving, nothing is written |
+| `scoreAssistantText` | `false` | Also score assistant prose. `/jev-compact text` turns it on per run |
+| `textKeepThreshold` | `0.3` | Keep threshold for prose, deliberately stricter than for tool calls |
+| `textMinChars` | `400` | Assistant messages shorter than this are never candidates |
 
 `TYPESAFE_API_KEY` is read from the environment. A key stored by `/typesafe
 login` may also be usable through `pi-typesafe`; that integration is not decided
@@ -148,7 +164,7 @@ Established by reading source only:
 - `appendMessage` performs no pairing, ordering, or content validation.
 - `convertToLlm` is an elementwise type mapper with no pairing logic.
 
-Covered by the test suite (71 tests, `npm test`):
+Covered by the test suite (85 tests, `npm test`):
 
 - Live-window collection, including orphan recovery when `firstKeptEntryId` is
   empty or missing, and skipping entry kinds that do not reach context.
@@ -168,6 +184,10 @@ Covered by the test suite (71 tests, `npm test`):
 - Session replacement: post-write reporting happens through the `withSession`
   context, and a test fails if the captured command `ctx` is touched after the
   session has been replaced.
+- Prose scoring: only long assistant text is a candidate, pinned blocks are not
+  sent, a tool call survives its message losing its text, user text is never
+  removed, the stricter threshold is enforced, and a prose-scoring failure fails
+  the run instead of writing a partial result.
 
 ## Checking what a run actually did
 
@@ -299,7 +319,7 @@ untouched by this extension.
 
 ```bash
 npm install
-npm test        # 71 tests, fake Jev, no network
+npm test        # 85 tests, fake Jev, no network
 npm run typecheck
 ```
 
@@ -324,6 +344,7 @@ tests/e2e.test.ts             the registered command, stubbed transport
 tests/large-window.test.ts    overflow and slicing on call-heavy sessions
 tests/evidence.test.ts        reported tokens, timings, model, score spread
 tests/report.test.ts          HTML report contents, escaping, file permissions
+tests/text.test.ts            assistant prose scoring and removal
 ```
 
 `planCompaction` is exported so the decision path can be driven without a Pi

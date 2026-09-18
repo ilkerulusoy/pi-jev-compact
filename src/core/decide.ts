@@ -7,6 +7,8 @@ import type {
   JevQuestions,
   Settings,
   ToolCall,
+  TextBlock,
+  TextDecision,
 } from "../types";
 
 /** Tokens the request envelope adds around state and questions. */
@@ -187,4 +189,98 @@ export async function scoreCalls(
     elapsedMs: Date.now() - started,
     slowestRequestMs,
   };
+}
+
+/**
+ * The question asked about one assistant prose block.
+ *
+ * Deliberately narrower than the tool-call questions. Removing prose destroys
+ * the only record of that reasoning, so the question asks whether it is
+ * *superseded*, not merely whether it is still interesting.
+ */
+export function textQuestionFor(block: TextBlock): JevQuestions {
+  return {
+    [`text_${block.id}`]: {
+      type: "noul",
+      instructions: `Message ${block.messageIndex} in the history is assistant prose of ${block.chars} characters. It should stay in the history verbatim: it records a decision, a constraint, a finding, or an explanation that still bears on the goal and is not restated by later messages`,
+      criteria: {
+        true: "It carries a decision, constraint, finding, correction, or explanation that later messages rely on and do not repeat.",
+        false: "It is narration of work already visible in the tool calls, a restatement of a later message, or commentary with no bearing on the goal.",
+      },
+    },
+  };
+}
+
+export function decideText(
+  block: TextBlock,
+  keepText: number,
+  textKeepThreshold: number,
+): TextDecision {
+  const base = { id: block.id, messageIndex: block.messageIndex, chars: block.chars, keepText };
+  if (block.pinned) return { ...base, action: "keep", reason: "pinned" };
+  if (keepText >= textKeepThreshold) return { ...base, action: "keep", reason: "kept" };
+  return { ...base, action: "drop_text", reason: "text_dropped" };
+}
+
+/**
+ * Score assistant prose. Runs as its own set of requests rather than riding on
+ * the tool-call batches, so the state budget is computed once and the two
+ * question kinds cannot crowd each other out.
+ */
+export async function scoreTextBlocks(
+  blocks: readonly TextBlock[],
+  state: CompactionState,
+  stateTokens: number,
+  asker: JevAsker,
+  settings: Pick<Settings, "textKeepThreshold" | "maxRequestTokens">,
+): Promise<{ decisions: TextDecision[]; requests: number; inputTokens: number; outputTokens: number; questionsAsked: number }> {
+  const candidates = blocks.filter((block) => !block.pinned);
+  const scores = new Map<string, number>();
+  let requests = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let questionsAsked = 0;
+
+  if (candidates.length > 0) {
+    const budget = settings.maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
+    const batches: TextBlock[][] = [];
+    let current: TextBlock[] = [];
+    let currentTokens = 0;
+    for (const block of candidates) {
+      const tokens = estimateTokens(JSON.stringify(textQuestionFor(block)));
+      if (current.length > 0 && currentTokens + tokens > budget) {
+        batches.push(current);
+        current = [];
+        currentTokens = 0;
+      }
+      if (current.length === 0 && tokens > budget) {
+        throw new Error(
+          `state leaves no room for text questions (~${stateTokens} of ${settings.maxRequestTokens} tokens)`,
+        );
+      }
+      current.push(block);
+      currentTokens += tokens;
+    }
+    if (current.length > 0) batches.push(current);
+    requests = batches.length;
+
+    const outcomes = await Promise.all(
+      batches.map(async (batch) => {
+        const questions: JevQuestions = Object.assign({}, ...batch.map(textQuestionFor));
+        const response = await asker.ask(state, questions);
+        return { batch, response, questions: Object.keys(questions).length };
+      }),
+    );
+    for (const { batch, response, questions } of outcomes) {
+      for (const block of batch) scores.set(block.id, noulOf(response.answers, `text_${block.id}`));
+      inputTokens += response.usage?.input_tokens ?? 0;
+      outputTokens += response.usage?.output_tokens ?? 0;
+      questionsAsked += questions;
+    }
+  }
+
+  const decisions = blocks.map((block) =>
+    decideText(block, scores.get(block.id) ?? 1, settings.textKeepThreshold),
+  );
+  return { decisions, requests, inputTokens, outputTokens, questionsAsked };
 }

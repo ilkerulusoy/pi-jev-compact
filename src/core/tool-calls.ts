@@ -1,5 +1,5 @@
 import { textOf } from "./live-window";
-import type { LiveMessage, ToolCall } from "../types";
+import type { LiveMessage, TextBlock, ToolCall } from "../types";
 
 /** The first message and the newest `preserveRecentMessages` are never touched. */
 export function isPinned(index: number, total: number, preserveRecent: number): boolean {
@@ -66,4 +66,32 @@ export function messageChars(message: any): number {
   }
   if (typeof message.summary === "string") total += message.summary.length;
   return total;
+}
+
+/**
+ * Assistant prose blocks that are candidates for removal.
+ *
+ * Only assistant text qualifies. User messages are the record of what was asked
+ * and are never candidates. A message is skipped when it is pinned, when its
+ * text is short enough not to matter, or when it carries a tool call whose
+ * arguments would be orphaned by removing the text around them.
+ */
+export function collectTextBlocks(
+  messages: readonly LiveMessage[],
+  preserveRecent: number,
+  minChars: number,
+): TextBlock[] {
+  const blocks: TextBlock[] = [];
+  messages.forEach(({ message }, messageIndex) => {
+    if (message?.role !== "assistant") return;
+    const chars = textOf(message.content).length;
+    if (chars < minChars) return;
+    blocks.push({
+      id: `x${blocks.length + 1}`,
+      messageIndex,
+      chars,
+      pinned: isPinned(messageIndex, messages.length, preserveRecent),
+    });
+  });
+  return blocks;
 }

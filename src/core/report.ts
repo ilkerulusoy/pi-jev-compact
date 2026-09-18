@@ -1,4 +1,4 @@
-import type { CallDecision, LiveMessage, Settings, ToolCall } from "../types";
+import type { CallDecision, LiveMessage, Settings, TextDecision, ToolCall } from "../types";
 import { textOf } from "./live-window";
 import type { TraceEntry } from "./trace";
 
@@ -12,6 +12,8 @@ export interface ReportInput {
   stats: Record<string, unknown>;
   stateSample: string;
   written: boolean;
+  /** Prose decisions, empty unless assistant text was scored. */
+  textDecisions?: readonly TextDecision[];
 }
 
 const escape = (value: unknown): string =>
@@ -83,6 +85,23 @@ export function renderHtmlReport(input: ReportInput): string {
 <td class="prob"><span class="bar">${bar(decision.keepResult, settings.keepThreshold)}</span> ${decision.keepResult.toFixed(2)}</td>
 <td class="action">${escape(ACTION_LABEL[decision.action])}${decision.reason === "pinned" ? " <em>(pinned)</em>" : ""}</td>
 <td class="preview">${escape(resultPreview(messages, call))}</td>
+</tr>`;
+    })
+    .join("\n");
+
+  const textRows = (input.textDecisions ?? [])
+    .map((decision) => {
+      const message = messages[decision.messageIndex]?.message;
+      const preview = textOf(message?.content).replace(/\s+/g, " ").trim().slice(0, 200);
+      const saved = decision.action === "drop_text" ? decision.chars : 0;
+      return `<tr class="${decision.action === "drop_text" ? "drop_call" : "keep"}">
+<td class="id">${escape(decision.id)}</td>
+<td class="num">${decision.messageIndex}</td>
+<td class="num">${decision.chars.toLocaleString()}</td>
+<td class="num saved">${saved ? `−${saved.toLocaleString()}` : "—"}</td>
+<td class="prob"><span class="bar">${bar(decision.keepText, settings.textKeepThreshold)}</span> ${decision.keepText.toFixed(2)}</td>
+<td class="action">${decision.action === "drop_text" ? "prose removed" : "kept"}${decision.reason === "pinned" ? " <em>(pinned)</em>" : ""}</td>
+<td class="preview">${escape(preview)}</td>
 </tr>`;
     })
     .join("\n");
@@ -201,6 +220,12 @@ ${requests || "<p>No request was sent.</p>"}
 </tr></thead><tbody>
 ${rows || "<tr><td colspan=9>No calls were scored.</td></tr>"}
 </tbody></table>
+
+${textRows ? `<h2>Assistant prose</h2>
+<p class="sub">Prose is opt-in and uses a stricter threshold (${settings.textKeepThreshold}) than tool calls (${settings.keepThreshold}), because a dropped tool result can be recovered by running the tool again and dropped reasoning cannot.</p>
+<table><thead><tr><th>id</th><th>message</th><th>chars</th><th>saved</th><th>keepText</th><th>outcome</th><th>preview</th></tr></thead><tbody>
+${textRows}
+</tbody></table>` : ""}
 
 <h2>Extremes</h2>
 <div class="lists">

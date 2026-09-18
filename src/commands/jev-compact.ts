@@ -1,13 +1,13 @@
 import { collectLiveWindow, goalFrom } from "../core/live-window";
-import { collectToolCalls, messageChars } from "../core/tool-calls";
-import { scoreCalls } from "../core/decide";
+import { collectTextBlocks, collectToolCalls, messageChars } from "../core/tool-calls";
+import { scoreCalls, scoreTextBlocks } from "../core/decide";
 import { fitState, StateTooLargeError } from "../core/state";
 import { planReplay, reductionRatio, validatePlan } from "../core/replay";
 import { JevClient, SYSTEM_ONE_URL, resolveApiKey } from "../core/jev";
 import { TracingAsker, stamp, writeOwnerOnly } from "../core/trace";
 import { renderHtmlReport } from "../core/report";
 import { DEFAULT_SETTINGS } from "../types";
-import type { CallDecision, JevAsker, LiveMessage, Settings, ToolCall } from "../types";
+import type { CallDecision, JevAsker, LiveMessage, Settings, TextDecision, ToolCall } from "../types";
 
 export interface RunOutcome {
   status: "ok" | "nothing_to_do" | "below_threshold" | "unsafe" | "error";
@@ -30,6 +30,8 @@ export interface RunOutcome {
     inputTokens: number;
     outputTokens: number;
     questionsAsked: number;
+    textBlocks?: number;
+    textDropped?: number;
     elapsedMs: number;
     slowestRequestMs: number;
     /** Distribution of keepResult, to show what the scores looked like. */
@@ -47,6 +49,8 @@ export interface RunOutcome {
   window?: LiveMessage[];
   /** First part of the fitted history, so the report can show what Jev saw. */
   stateSample?: string;
+  /** Prose decisions, empty unless scoreAssistantText is on. */
+  textDecisions?: TextDecision[];
 }
 
 const count = (decisions: readonly CallDecision[], reason: CallDecision["reason"]): number =>
@@ -71,10 +75,19 @@ export async function planCompaction(
 
   const calls = collectToolCalls(window.messages, settings.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
-  if (candidates.length === 0) {
+  // With prose scoring on, a window of pure conversation is still worth scoring,
+  // so the absence of tool calls is not on its own a reason to stop.
+  const textCandidates = settings.scoreAssistantText
+    ? collectTextBlocks(window.messages, settings.preserveRecentMessages, settings.textMinChars).filter(
+        (block) => !block.pinned,
+      ).length
+    : 0;
+  if (candidates.length === 0 && textCandidates === 0) {
     return {
       status: "nothing_to_do",
-      message: `pi-jev-compact: no unpinned tool calls in ${window.messages.length} live messages.`,
+      message: settings.scoreAssistantText
+        ? `pi-jev-compact: nothing to score in ${window.messages.length} live messages.`
+        : `pi-jev-compact: no unpinned tool calls in ${window.messages.length} live messages.`,
     };
   }
 
@@ -136,9 +149,44 @@ export async function planCompaction(
     return { status: "error", message: `pi-jev-compact: ${(error as Error).message}` };
   }
 
-  // Decisions are numbered against `scopedCalls`, so the plan must be built from
-  // the same list. Calls outside the slice are simply not in it and stay as they are.
-  const plan = planReplay(window.messages, scopedCalls, scored.decisions, settings);
+  // Assistant prose, scored separately and only when asked for. Text indices are
+  // relative to the scored window, which is what planReplay walks.
+  let textDecisions: TextDecision[] = [];
+  let textScoring = { requests: 0, inputTokens: 0, outputTokens: 0, questionsAsked: 0 };
+  if (settings.scoreAssistantText) {
+    const blocks = collectTextBlocks(
+      scoped,
+      scoped === window.messages ? settings.preserveRecentMessages : 0,
+      settings.textMinChars,
+    );
+    if (blocks.some((block) => !block.pinned)) {
+      try {
+        const result = await scoreTextBlocks(blocks, fitted.state, fitted.tokens, asker, settings);
+        textDecisions = result.decisions;
+        textScoring = {
+          requests: result.requests,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          questionsAsked: result.questionsAsked,
+        };
+      } catch (error) {
+        // Prose scoring is additive. If it fails, keep the tool-call result rather
+        // than losing the whole run, and say so.
+        textDecisions = [];
+        return {
+          status: "error",
+          message: `pi-jev-compact: tool calls were scored but prose scoring failed: ${(error as Error).message}`,
+        };
+      }
+    }
+  }
+
+  // The plan must cover the WHOLE window: messages outside the scored slice are
+  // carried over untouched, and dropping them here would lose them. Call
+  // decisions address messages by tool call id, so they are slice-independent,
+  // but text decisions carry indices into `scoped`, which shares its prefix with
+  // the full window, so the indices line up.
+  const plan = planReplay(window.messages, scopedCalls, scored.decisions, settings, textDecisions);
   const problems = validatePlan(plan.messages);
   if (problems.length > 0) {
     return {
@@ -168,11 +216,13 @@ export async function planCompaction(
     reduction,
     stateTokens: fitted.tokens,
     stateStage: fitted.stage,
-    requests: scored.requests,
+    requests: scored.requests + textScoring.requests,
     models: scored.models,
-    inputTokens: scored.inputTokens,
-    outputTokens: scored.outputTokens,
-    questionsAsked: scored.questionsAsked,
+    inputTokens: scored.inputTokens + textScoring.inputTokens,
+    outputTokens: scored.outputTokens + textScoring.outputTokens,
+    questionsAsked: scored.questionsAsked + textScoring.questionsAsked,
+    textBlocks: textDecisions.length,
+    textDropped: textDecisions.filter((d) => d.action === "drop_text").length,
     elapsedMs: scored.elapsedMs,
     slowestRequestMs: scored.slowestRequestMs,
     scoreBuckets,
@@ -206,6 +256,7 @@ export async function planCompaction(
       scoredCalls: scopedCalls,
       window: scoped,
       stateSample,
+      textDecisions,
     };
   }
 
@@ -219,6 +270,7 @@ export async function planCompaction(
     scoredCalls: scopedCalls,
     window: scoped,
     stateSample,
+    textDecisions,
   };
 }
 
@@ -281,10 +333,14 @@ export function evidenceLines(outcome: RunOutcome, settings: Settings): string[]
 
 export function registerJevCompactCommand(pi: any): void {
   pi.registerCommand("jev-compact", {
-    description: "Compact this session with Jev: drop stale tool calls, keep everything else verbatim",
+    description:
+      "Compact this session with Jev. Args: 'report' to inspect without writing, 'text' to also score assistant prose",
     handler: async (args: string, ctx: any) => {
-      const report = args?.trim() === "report";
-      const settings: Settings = { ...DEFAULT_SETTINGS };
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const report = words.includes("report");
+      // Opt-in per run: removing prose cannot be undone by re-running a tool.
+      const withText = words.includes("text");
+      const settings: Settings = { ...DEFAULT_SETTINGS, scoreAssistantText: withText };
 
       const apiKey = resolveApiKey();
       if (!apiKey) {
@@ -381,6 +437,7 @@ export function registerJevCompactCommand(pi: any): void {
                   stats: (outcome.stats ?? {}) as Record<string, unknown>,
                   stateSample: outcome.stateSample ?? "",
                   written: true,
+                  textDecisions: outcome.textDecisions ?? [],
                 }),
               );
             } catch {

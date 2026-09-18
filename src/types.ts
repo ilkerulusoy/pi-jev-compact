@@ -32,6 +32,25 @@ export interface CallDecision extends CallAnswer {
   reason: "pinned" | "kept" | "result_dropped" | "call_dropped";
 }
 
+/** A candidate assistant prose block, addressed by its position in the window. */
+export interface TextBlock {
+  /** Short id used in the state and question names: x1, x2, ... */
+  id: string;
+  /** Index in the live window. */
+  messageIndex: number;
+  chars: number;
+  pinned: boolean;
+}
+
+export interface TextDecision {
+  id: string;
+  messageIndex: number;
+  chars: number;
+  keepText: number;
+  action: "keep" | "drop_text";
+  reason: "pinned" | "kept" | "text_dropped";
+}
+
 /** One entry of the live window: the session entry id plus its context message. */
 export interface LiveMessage {
   entryId: string;
@@ -92,6 +111,19 @@ export interface Settings {
   truncateHeadChars: number;
   minReductionRatio: number;
   model: string;
+  /**
+   * Ask Jev whether assistant prose still matters, and remove it when it does
+   * not. Off by default: a dropped tool result can be recovered by running the
+   * tool again, but dropped reasoning cannot be recovered at all.
+   */
+  scoreAssistantText: boolean;
+  /**
+   * Keep threshold for assistant prose, separate from and higher than the one
+   * for tool calls, because the mistake is irreversible.
+   */
+  textKeepThreshold: number;
+  /** Assistant messages shorter than this are never candidates. */
+  textMinChars: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -102,4 +134,7 @@ export const DEFAULT_SETTINGS: Settings = {
   truncateHeadChars: 300,
   minReductionRatio: 0.25,
   model: "jev-latest",
+  scoreAssistantText: false,
+  textKeepThreshold: 0.3,
+  textMinChars: 400,
 };
